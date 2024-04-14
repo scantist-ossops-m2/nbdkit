@@ -44,40 +44,87 @@
 #include "byte-swapping.h"
 #include "protocol.h"
 
+/* eflags calculation is the same between oldstyle and newstyle
+ * protocols.
+ */
 int
-protocol_handshake_oldstyle (struct connection *conn)
+protocol_compute_eflags (struct connection *conn, uint16_t *flags)
 {
-  struct old_handshake handshake;
-  uint64_t exportsize;
-  uint16_t gflags, eflags;
+  uint16_t eflags = NBD_FLAG_HAS_FLAGS;
+  int fl;
 
-  /* In --tls=require / FORCEDTLS mode, old style handshakes are
-   * rejected because they cannot support TLS.
-   */
-  if (tls == 2) {
-    nbdkit_error ("non-TLS client tried to connect in --tls=require mode");
+  fl = backend->can_write (backend, conn);
+  if (fl == -1)
     return -1;
+  if (readonly || !fl) {
+    eflags |= NBD_FLAG_READ_ONLY;
+    conn->readonly = true;
+  }
+  if (!conn->readonly) {
+    fl = backend->can_zero (backend, conn);
+    if (fl == -1)
+      return -1;
+    if (fl) {
+      eflags |= NBD_FLAG_SEND_WRITE_ZEROES;
+      conn->can_zero = true;
+    }
+
+    fl = backend->can_trim (backend, conn);
+    if (fl == -1)
+      return -1;
+    if (fl) {
+      eflags |= NBD_FLAG_SEND_TRIM;
+      conn->can_trim = true;
+    }
+
+    fl = backend->can_fua (backend, conn);
+    if (fl == -1)
+      return -1;
+    if (fl) {
+      eflags |= NBD_FLAG_SEND_FUA;
+      conn->can_fua = true;
+    }
   }
 
-  if (protocol_common_open (conn, &exportsize, &eflags) == -1)
+  fl = backend->can_flush (backend, conn);
+  if (fl == -1)
     return -1;
-  conn->exportsize = exportsize;
-
-  gflags = 0;
-  debug ("oldstyle negotiation: flags: global 0x%x export 0x%x",
-         gflags, eflags);
-
-  memset (&handshake, 0, sizeof handshake);
-  memcpy (handshake.nbdmagic, "NBDMAGIC", 8);
-  handshake.version = htobe64 (OLD_VERSION);
-  handshake.exportsize = htobe64 (exportsize);
-  handshake.gflags = htobe16 (gflags);
-  handshake.eflags = htobe16 (eflags);
-
-  if (conn->send (conn, &handshake, sizeof handshake) == -1) {
-    nbdkit_error ("write: %m");
-    return -1;
+  if (fl) {
+    eflags |= NBD_FLAG_SEND_FLUSH;
+    conn->can_flush = true;
   }
 
+  fl = backend->is_rotational (backend, conn);
+  if (fl == -1)
+    return -1;
+  if (fl) {
+    eflags |= NBD_FLAG_ROTATIONAL;
+    conn->is_rotational = true;
+  }
+
+  fl = backend->can_multi_conn (backend, conn);
+  if (fl == -1)
+    return -1;
+  if (fl) {
+    eflags |= NBD_FLAG_CAN_MULTI_CONN;
+    conn->can_multi_conn = true;
+  }
+
+  *flags = eflags;
   return 0;
+}
+
+int
+protocol_handshake (struct connection *conn)
+{
+  int r;
+
+  lock_request (conn);
+  if (!newstyle)
+    r = protocol_handshake_oldstyle (conn);
+  else
+    r = protocol_handshake_newstyle (conn);
+  unlock_request (conn);
+
+  return r;
 }
